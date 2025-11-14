@@ -1,0 +1,106 @@
+name: CI - Train & Build Bento
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'customer_churn_dataset-**'
+      - 'preprocessing_utils.py'
+      - 'train/**'
+      - 'bento_service/**'
+      - 'api/**'
+      - 'cust1_train.ipynb'
+      - 'cust1_prediction.ipynb'
+      - 'model.pkl'
+
+jobs:
+  train_and_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Install MLflow & BentoML & deps
+        run: |
+          pip install mlflow bentoml boto3 scikit-learn pandas joblib
+
+      - name: Start MLflow server background
+        run: |
+          mkdir -p mlflow_artifacts
+          nohup mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./mlflow_artifacts --host 0.0.0.0 --port 5000 > mlflow.log 2>&1 &
+          sleep 3
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+
+      - name: Wait for mlflow
+        run: |
+          for i in {1..10}; do
+            curl -sSf http://127.0.0.1:5000 || sleep 1
+          done
+
+      - name: Run training
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+        run: |
+          pip install -r train/requirements_train.txt || true
+          python train/train.py
+
+      - name: Import MLflow model into Bento store
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5000
+        run: |
+          # Find latest version number of registered model 'churn_model'
+          python - <<'PY'
+import mlflow
+from mlflow.tracking import MlflowClient
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+client = MlflowClient()
+# get registered model
+reg = client.get_registered_model("churn_model")
+# get latest version
+versions = client.get_latest_versions("churn_model")
+if not versions:
+    print("No registered versions found; exiting")
+    raise SystemExit(1)
+v = versions[-1].version
+model_uri = f"models:/churn_model/{v}"
+print("Model URI:", model_uri)
+# import into bentoml
+import bentoml
+bentoml.mlflow.import_model("churn_model_mlflow:latest", model_uri)
+print("Imported to BentoML store as churn_model_mlflow:latest")
+PY
+
+      - name: Build Bento service image
+        run: |
+          # create a minimal bentoml service bundle directory
+          # (we rely on bento_service/service.py being present)
+          pip install -r bento_service/bento_requirements.txt || true
+          # Use bentoml containerize to produce image; requires docker; this step will build a container in the runner
+          bentoml build -f bento_service/service.py || true
+          # Build and tag the container image (tag can be overwritten to push to registry)
+          IMAGE_TAG="${{ github.repository }}:bento-latest"
+          bentoml containerize churn_service:latest --image-name $IMAGE_TAG || true
+          echo "Built image: $IMAGE_TAG"
+        env:
+          BENTOML_HOME: ${{ runner.temp }}/bentoml_home
+
+      - name: Optional: push image to registry (configure secrets)
+        if: ${{ secrets.CONTAINER_REGISTRY_USERNAME && secrets.CONTAINER_REGISTRY_PASSWORD && secrets.CONTAINER_REGISTRY }}
+        env:
+          REGISTRY: ${{ secrets.CONTAINER_REGISTRY }}
+          USERNAME: ${{ secrets.CONTAINER_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.CONTAINER_REGISTRY_PASSWORD }}
+        run: |
+          echo "$PASSWORD" | docker login $REGISTRY -u "$USERNAME" --password-stdin
+          IMAGE_TAG="${{ github.repository }}:bento-latest"
+          docker tag $IMAGE_TAG $REGISTRY/$IMAGE_TAG
+          docker push $REGISTRY/$IMAGE_TAG
