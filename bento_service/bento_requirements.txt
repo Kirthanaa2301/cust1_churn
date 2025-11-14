@@ -1,0 +1,4 @@
+bentoml
+pandas
+scikit-learn
+joblib
